@@ -10,8 +10,7 @@ import {
     Eye, EyeOff, Save, Trash2, ShieldCheck, Lock,
     Sparkles, Zap, ChevronLeft, Phone, Check, CheckCheck, ArrowLeft,
     MoreVertical, Trash, Star, Heart, ThumbsUp, Smile, Frown, Meh,
-    Volume2, VolumeX, Minimize2, Maximize2, CameraOff, SwitchCamera,
-    Activity
+    Volume2, VolumeX, Minimize2, Maximize2, CameraOff, SwitchCamera
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -61,35 +60,31 @@ export function Chat({ session, privateKey, initialContact, isPartnerOnline, onB
   const [isTyping, setIsTyping] = useState(false);
   const [contactProfile, setContactProfile] = useState<any>(initialContact);
   const [myPublicKey, setMyPublicKey] = useState<CryptoKey | null>(null);
-  
-  const [partnerInChat, setPartnerInChat] = useState(false);
-  const [partnerTyping, setPartnerTyping] = useState(false);
-  
+  const [partnerPresence, setPartnerPresence] = useState<{isOnline: boolean; isInChat: boolean; isTyping: boolean;}>({ isOnline: false, isInChat: false, isTyping: false });
   const [isFocused, setIsFocused] = useState(true);
   const [showSnapshotView, setShowSnapshotView] = useState<any>(null);
   const [showSaveToVault, setShowSaveToVault] = useState<any>(null);
   const [vaultPassword, setVaultPassword] = useState("");
   const [longPressedMessage, setLongPressedMessage] = useState<any>(null);
-  const [showMenu, setShowMenu] = useState(false);
-  const [autoDeleteMode, setAutoDeleteMode] = useState<"none" | "view" | "1m" | "3h">(() => {
-    if (typeof window !== "undefined") {
-      return (localStorage.getItem(`chatify_auto_delete_${session.user.id}_${initialContact.id}`) as any) || "none";
-    }
-    return "none";
-  });
+    const [showMenu, setShowMenu] = useState(false);
+    const [autoDeleteMode, setAutoDeleteMode] = useState<"none" | "view" | "1m" | "3h">(() => {
+      if (typeof window !== "undefined") {
+        return (localStorage.getItem(`chatify_auto_delete_${session.user.id}`) as any) || "none";
+      }
+      return "none";
+    });
+    const [partnerIsTyping, setPartnerIsTyping] = useState(false);
+    const presenceChannel = useRef<any>(null);
 
   useEffect(() => {
-    localStorage.setItem(`chatify_auto_delete_${session.user.id}_${initialContact.id}`, autoDeleteMode);
-  }, [autoDeleteMode, session.user.id, initialContact.id]);
+    localStorage.setItem(`chatify_auto_delete_${session.user.id}`, autoDeleteMode);
+  }, [autoDeleteMode, session.user.id]);
 
   const [showCamera, setShowCamera] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [cameraFacingMode, setCameraFacingMode] = useState<"user" | "environment">("user");
   
-  const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const chatChannelRef = useRef<any>(null);
-
   useEffect(() => {
     if (showCamera && stream && videoRef.current) {
       videoRef.current.srcObject = stream;
@@ -121,97 +116,25 @@ export function Chat({ session, privateKey, initialContact, isPartnerOnline, onB
     initMyPublicKey();
   }, [session.user.id]);
 
-  // Presence and Typing Broadcasting
-  useEffect(() => {
-    const channelId = [session.user.id, initialContact.id].sort().join("-");
-    const channel = supabase.channel(`chat-presence-${channelId}`);
-    chatChannelRef.current = channel;
-
-    channel
-      .on("presence", { event: "sync" }, () => {
-        const state = channel.presenceState();
-        const partnerPresent = Object.values(state).some((users: any) =>
-          users.some((u: any) => u.user_id === initialContact.id)
-        );
-        setPartnerInChat(partnerPresent);
-      })
-      .on("broadcast", { event: "typing" }, ({ payload }) => {
-        if (payload.user_id === initialContact.id) {
-          setPartnerTyping(payload.isTyping);
-        }
-      })
-      .subscribe(async (status) => {
-        if (status === "SUBSCRIBED") {
-          await channel.track({ user_id: session.user.id });
-        }
-      });
-
-    return () => {
-      supabase.removeChannel(channel);
-    };
-  }, [initialContact.id, session.user.id]);
-
-  const handleTypingBroadcast = (isTyping: boolean) => {
-    if (chatChannelRef.current) {
-      chatChannelRef.current.send({
-        type: "broadcast",
-        event: "typing",
-        payload: { user_id: session.user.id, isTyping },
-      });
-    }
-  };
-
-  const onInputChange = (val: string) => {
-    setNewMessage(val);
-    if (!isTyping) {
-      setIsTyping(true);
-      handleTypingBroadcast(true);
-    }
-    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
-    typingTimeoutRef.current = setTimeout(() => {
-      setIsTyping(false);
-      handleTypingBroadcast(false);
-    }, 2000);
-  };
-
   const decryptMessageContent = async (msg: any) => {
     try {
-      if (!msg.encrypted_content) return msg.decrypted_content || "";
-      let packet;
-      try {
-        packet = typeof msg.encrypted_content === 'string' ? JSON.parse(msg.encrypted_content) : msg.encrypted_content;
-      } catch (e) {
-        return msg.decrypted_content || msg.encrypted_content;
-      }
-      
-      if (!packet.iv || !packet.content || !packet.keys) return msg.decrypted_content || msg.encrypted_content;
-      
+      const packet = JSON.parse(msg.encrypted_content);
+      if (!packet.iv || !packet.content || !packet.keys) return msg.encrypted_content;
       const encryptedAESKey = packet.keys[session.user.id];
       if (!encryptedAESKey) return "[Encryption Error: Key Missing]";
-      
       const aesKey = await decryptAESKeyWithUserPrivateKey(encryptedAESKey, privateKey);
       return await decryptWithAES(packet.content, packet.iv, aesKey);
     } catch (e) {
-      console.error("Decryption failed:", e);
-      return msg.decrypted_content || "[Decryption Failed]";
+      return msg.encrypted_content;
     }
   };
 
   async function fetchMessages() {
     setLoading(true);
-    const { data, error } = await supabase
-      .from("messages")
-      .select("*")
-      .or(`and(sender_id.eq.${session.user.id},receiver_id.eq.${initialContact.id}),and(sender_id.eq.${initialContact.id},receiver_id.eq.${session.user.id})`)
-      .order("created_at", { ascending: true });
-    
+    const { data, error } = await supabase.from("messages").select("*").or(`and(sender_id.eq.${session.user.id},receiver_id.eq.${initialContact.id}),and(sender_id.eq.${initialContact.id},receiver_id.eq.${session.user.id})`).order("created_at", { ascending: true });
     if (!error) {
-      const decryptedMessages = await Promise.all((data || []).map(async msg => ({ 
-        ...msg, 
-        decrypted_content: await decryptMessageContent(msg) 
-      })));
+      const decryptedMessages = await Promise.all((data || []).map(async msg => ({ ...msg, decrypted_content: await decryptMessageContent(msg) })));
       setMessages(decryptedMessages);
-      
       const unviewed = data?.filter(m => m.receiver_id === session.user.id && !m.is_viewed) || [];
       if (unviewed.length > 0) {
         await supabase.from("messages").update({ is_viewed: true, viewed_at: new Date().toISOString() }).in("id", unviewed.map(m => m.id));
@@ -220,117 +143,182 @@ export function Chat({ session, privateKey, initialContact, isPartnerOnline, onB
     setLoading(false);
   }
 
-  function subscribeToMessages() {
-    return supabase.channel(`messages-${initialContact.id}-${session.user.id}`)
-      .on("postgres_changes", { 
-        event: "INSERT", 
-        schema: "public", 
-        table: "messages", 
-        filter: `receiver_id=eq.${session.user.id}` 
-      }, async (payload) => {
-        if (payload.new.sender_id === initialContact.id) {
-          const decryptedContent = await decryptMessageContent(payload.new);
-          const msg = { ...payload.new, decrypted_content: decryptedContent };
-          setMessages(prev => {
-            if (prev.some(m => m.id === msg.id)) return prev;
-            return [...prev, msg];
-          });
-          
-          await supabase.from("messages").update({ 
-            is_delivered: true, 
-            delivered_at: new Date().toISOString(),
-            is_viewed: true,
-            viewed_at: new Date().toISOString()
-          }).eq("id", payload.new.id);
-          
-          if (payload.new.media_type === 'snapshot') {
-            toast.info("Snapshot Received");
-            setShowSnapshotView(msg);
+    function subscribeToMessages() {
+      const channelId = `chat-messages-${[session.user.id, initialContact.id].sort().join("-")}`;
+      return supabase.channel(channelId)
+        .on("postgres_changes", { 
+          event: "INSERT", 
+          schema: "public", 
+          table: "messages", 
+          filter: `receiver_id=eq.${session.user.id}` 
+        }, async (payload) => {
+          if (payload.new.sender_id === initialContact.id) {
+            const decryptedContent = await decryptMessageContent(payload.new);
+            const msg = { ...payload.new, decrypted_content: decryptedContent };
+            setMessages(prev => {
+              if (prev.find(m => m.id === msg.id)) return prev;
+              return [...prev, msg];
+            });
+            await supabase.from("messages").update({ is_delivered: true, delivered_at: new Date().toISOString() }).eq("id", payload.new.id);
+            if (payload.new.media_type === 'snapshot') {
+              toast.info("Snapshot Received");
+              setShowSnapshotView(msg);
+            }
           }
-        }
-      })
-      .on("postgres_changes", { 
-        event: "UPDATE", 
-        schema: "public", 
-        table: "messages"
-      }, async (payload) => {
-        // Filter manually to ensure it's for this conversation
-        const msg = payload.new;
-        if ((msg.sender_id === session.user.id && msg.receiver_id === initialContact.id) ||
-            (msg.sender_id === initialContact.id && msg.receiver_id === session.user.id)) {
-          const decryptedContent = await decryptMessageContent(msg);
-          setMessages(prev => prev.map(m => m.id === msg.id ? { ...msg, decrypted_content: decryptedContent } : m));
-        }
-      })
-      .subscribe();
-  }
+        })
+        .on("postgres_changes", { 
+          event: "UPDATE", 
+          schema: "public", 
+          table: "messages"
+        }, async (payload) => {
+          // Update message status or content if it belongs to this chat
+          if ((payload.new.sender_id === session.user.id && payload.new.receiver_id === initialContact.id) || 
+              (payload.new.sender_id === initialContact.id && payload.new.receiver_id === session.user.id)) {
+            const decryptedContent = await decryptMessageContent(payload.new);
+            setMessages(prev => prev.map(m => m.id === payload.new.id ? { ...payload.new, decrypted_content: decryptedContent } : m));
+          }
+        })
+        .on("postgres_changes", {
+          event: "INSERT",
+          schema: "public",
+          table: "messages",
+          filter: `sender_id=eq.${session.user.id}`
+        }, async (payload) => {
+           if (payload.new.receiver_id === initialContact.id) {
+             // Handle messages sent from other tabs/devices
+             const decryptedContent = await decryptMessageContent(payload.new);
+             const msg = { ...payload.new, decrypted_content: decryptedContent };
+             setMessages(prev => {
+               if (prev.find(m => m.id === msg.id)) return prev;
+               return [...prev, msg];
+             });
+           }
+        })
+        .subscribe();
+    }
 
   useEffect(() => {
     fetchMessages();
     const subscription = subscribeToMessages();
     return () => { supabase.removeChannel(subscription); };
-  }, [initialContact.id]);
+  }, [initialContact]);
 
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
 
-  async function sendMessage(mediaType: string = "text", mediaUrl: string | null = null) {
-    if (!newMessage.trim() && !mediaUrl) return;
-    if (!myPublicKey || !initialContact.public_key) { toast.error("Encryption keys not synchronized."); return; }
-    try {
-      const aesKey = await generateAESKey();
-      const contentToEncrypt = newMessage.trim() || " ";
-      const encrypted = await encryptWithAES(contentToEncrypt, aesKey);
-      const partnerKey = await importPublicKey(initialContact.public_key);
-      const encryptedKeyForPartner = await encryptAESKeyForUser(aesKey, partnerKey);
-      const encryptedKeyForMe = await encryptAESKeyForUser(aesKey, myPublicKey);
-      
-      const packet = JSON.stringify({ 
-        iv: encrypted.iv, 
-        content: encrypted.content, 
-        keys: { 
-          [session.user.id]: encryptedKeyForMe, 
-          [initialContact.id]: encryptedKeyForPartner 
-        } 
+    useEffect(() => {
+      const channelId = `chat-session-${[session.user.id, initialContact.id].sort().join("-")}`;
+      const channel = supabase.channel(channelId, {
+        config: { presence: { key: session.user.id } }
       });
 
-      let expiresAt = null;
-      if (autoDeleteMode === "1m") {
-        expiresAt = new Date(Date.now() + 60 * 1000).toISOString();
-      } else if (autoDeleteMode === "3h") {
-        expiresAt = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString();
-      }
+      channel
+        .on("presence", { event: "sync" }, () => {
+          const state = channel.presenceState();
+          const partnerState: any = Object.values(state).find((presences: any) => 
+            presences.some((p: any) => p.user_id === initialContact.id)
+          );
+          if (partnerState) {
+            const isPartnerTyping = partnerState.some((p: any) => p.is_typing);
+            setPartnerIsTyping(isPartnerTyping);
+          } else {
+            setPartnerIsTyping(false);
+          }
+        })
+        .on("presence", { event: "join" }, ({ key, newPresences }) => {
+          if (key === initialContact.id) {
+            const isTyping = newPresences.some((p: any) => p.is_typing);
+            setPartnerIsTyping(isTyping);
+          }
+        })
+        .on("presence", { event: "leave" }, ({ key }) => {
+          if (key === initialContact.id) {
+            setPartnerIsTyping(false);
+          }
+        })
+        .subscribe(async (status) => {
+          if (status === "SUBSCRIBED") {
+            await channel.track({
+              user_id: session.user.id,
+              is_typing: newMessage.length > 0,
+              online_at: new Date().toISOString()
+            });
+          }
+        });
 
-      const messageData: any = { 
-        sender_id: session.user.id, 
-        receiver_id: initialContact.id, 
-        encrypted_content: packet, 
-        media_type: mediaType, 
-        media_url: mediaUrl, 
-        is_viewed: false, 
-        is_delivered: partnerInChat || isPartnerOnline, 
-        expires_at: expiresAt, 
-        is_view_once: autoDeleteMode === "view" 
+      presenceChannel.current = channel;
+
+      return () => {
+        channel.unsubscribe();
       };
+    }, [initialContact.id]);
 
-      if (mediaType === 'snapshot') { 
-        messageData.view_count = 0; 
-        messageData.is_view_once = true; 
+    useEffect(() => {
+      if (presenceChannel.current) {
+        presenceChannel.current.track({
+          user_id: session.user.id,
+          is_typing: newMessage.length > 0,
+          online_at: new Date().toISOString()
+        });
       }
+    }, [newMessage]);
 
-      const { data, error } = await supabase.from("messages").insert(messageData).select();
-      if (!error) {
-        const sentMsg = data?.[0] || messageData;
-        sentMsg.decrypted_content = contentToEncrypt;
-        setMessages(prev => [...prev, sentMsg]);
-        setNewMessage("");
-        setShowOptions(false);
-        handleTypingBroadcast(false);
-      }
-    } catch (e) { 
-      console.error(e);
-      toast.error("Encryption failed"); 
+    async function sendMessage(mediaType: string = "text", mediaUrl: string | null = null) {
+      if (!newMessage.trim() && !mediaUrl) return;
+      if (!myPublicKey || !initialContact.public_key) { toast.error("Encryption keys not synchronized."); return; }
+      try {
+        const aesKey = await generateAESKey();
+        const contentToEncrypt = newMessage.trim() || " ";
+        const encrypted = await encryptWithAES(contentToEncrypt, aesKey);
+        const partnerKey = await importPublicKey(initialContact.public_key);
+        const encryptedKeyForPartner = await encryptAESKeyForUser(aesKey, partnerKey);
+        const encryptedKeyForMe = await encryptAESKeyForUser(aesKey, myPublicKey);
+        
+        const packet = JSON.stringify({ 
+          iv: encrypted.iv, 
+          content: encrypted.content, 
+          keys: { 
+            [session.user.id]: encryptedKeyForMe, 
+            [initialContact.id]: encryptedKeyForPartner 
+          } 
+        });
+
+        let expires_at = null;
+        if (autoDeleteMode === "1m") {
+          expires_at = new Date(Date.now() + 60 * 1000).toISOString();
+        } else if (autoDeleteMode === "3h") {
+          expires_at = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString();
+        }
+
+        const messageData: any = { 
+          sender_id: session.user.id, 
+          receiver_id: initialContact.id, 
+          encrypted_content: packet, 
+          media_type: mediaType, 
+          media_url: mediaUrl, 
+          is_viewed: false, 
+          is_delivered: isPartnerOnline, 
+          expires_at, 
+          is_view_once: autoDeleteMode === "view" 
+        };
+        if (mediaType === 'snapshot') { messageData.view_count = 0; messageData.is_view_once = true; }
+        const { data, error } = await supabase.from("messages").insert(messageData).select();
+        if (!error) {
+          const sentMsg = data?.[0] || messageData;
+          sentMsg.decrypted_content = contentToEncrypt;
+          setMessages(prev => [...prev, sentMsg]);
+          setNewMessage("");
+          setShowOptions(false);
+          
+          if (presenceChannel.current) {
+            presenceChannel.current.track({
+              user_id: session.user.id,
+              is_typing: false,
+              online_at: new Date().toISOString()
+            });
+          }
+        }
+      } catch (e) { toast.error("Encryption failed"); }
     }
-  }
 
   const startCamera = async (facingMode: "user" | "environment" = "user") => {
     try {
@@ -373,10 +361,7 @@ export function Chat({ session, privateKey, initialContact, isPartnerOnline, onB
   };
 
   const openSnapshot = async (message: any) => {
-    if (message.receiver_id === session.user.id && (message.view_count || 0) >= 2 && !message.is_saved) { 
-      toast.error("Purged"); 
-      return; 
-    }
+    if (message.receiver_id === session.user.id && (message.view_count || 0) >= 2 && !message.is_saved) { toast.error("Purged"); return; }
     setShowSnapshotView(message);
     if (message.receiver_id === session.user.id) {
       const newViews = (message.view_count || 0) + 1;
@@ -394,182 +379,79 @@ export function Chat({ session, privateKey, initialContact, isPartnerOnline, onB
   return (
     <div className="flex flex-col h-full bg-[#030303] relative overflow-hidden">
       <header className="h-20 border-b border-white/5 bg-black/40 backdrop-blur-3xl flex items-center justify-between px-6 z-20 shrink-0">
-          <div className="flex items-center gap-4">
-              <Button variant="ghost" size="icon" onClick={onBack} className="text-white/20 hover:text-white mr-1 lg:hidden bg-white/5 rounded-xl border border-white/5"><ArrowLeft className="w-6 h-6" /></Button>
-              <AvatarDisplay profile={initialContact} className="h-10 w-10 ring-2 ring-indigo-500/20" />
-              <div>
-                <h3 className="text-sm font-black italic tracking-tighter uppercase text-white">{initialContact.username}</h3>
-                <div className="flex items-center gap-1.5">
-                  <div className={`w-1.5 h-1.5 rounded-full ${partnerInChat || isPartnerOnline ? 'bg-emerald-500 animate-pulse' : 'bg-white/10'}`} />
-                  <p className={`text-[8px] font-bold uppercase tracking-widest ${partnerInChat || isPartnerOnline ? 'text-emerald-500' : 'text-white/20'}`}>
-                    {partnerInChat ? "In Chat" : isPartnerOnline ? "Online" : "Offline"}
-                  </p>
+            <div className="flex items-center gap-4">
+                <Button variant="ghost" size="icon" onClick={onBack} className="text-white/20 hover:text-white mr-1 lg:hidden bg-white/5 rounded-xl border border-white/5 transition-all active:scale-95"><ArrowLeft className="w-6 h-6" /></Button>
+                <div className="relative group">
+                  <AvatarDisplay profile={initialContact} className="h-10 w-10 ring-2 ring-indigo-500/20 group-hover:ring-indigo-500/50 transition-all" />
+                  {isPartnerOnline && <div className="absolute -bottom-0.5 -right-0.5 w-3 h-3 bg-emerald-500 rounded-full border-2 border-black animate-pulse shadow-[0_0_8px_rgba(16,185,129,0.8)]" />}
                 </div>
-              </div>
-          </div>
+                <div>
+                  <h3 className="text-sm font-black italic tracking-tighter uppercase text-white leading-none mb-1">{initialContact.username}</h3>
+                  <div className="flex items-center gap-2">
+                    <div className={`w-1.5 h-1.5 rounded-full ${isPartnerOnline ? 'bg-emerald-500 animate-pulse' : 'bg-white/20'}`} />
+                    <p className={`text-[8px] font-bold uppercase tracking-[0.2em] ${isPartnerOnline ? 'text-emerald-500' : 'text-white/30'}`}>
+                      {isPartnerOnline ? 'Uplink Established' : 'Node Offline'}
+                    </p>
+                  </div>
+                </div>
+            </div>
           <div className="flex items-center gap-2">
             <Button variant="ghost" size="icon" onClick={() => onInitiateCall(initialContact, "voice")} className="text-white/20 hover:text-white hover:bg-white/5 rounded-xl"><Phone className="w-4 h-4" /></Button>
             <Button variant="ghost" size="icon" onClick={() => onInitiateCall(initialContact, "video")} className="text-white/20 hover:text-white hover:bg-white/5 rounded-xl"><Video className="w-4 h-4" /></Button>
             <div className="relative">
               <Button variant="ghost" size="icon" onClick={() => setShowMenu(!showMenu)} className="text-white/20 hover:text-white hover:bg-white/5 rounded-xl"><MoreVertical className="w-4 h-4" /></Button>
-              <AnimatePresence>{showMenu && (
-                <motion.div initial={{ opacity: 0, y: 10, scale: 0.95 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 10, scale: 0.95 }} className="absolute right-0 top-12 w-48 bg-zinc-900 border border-white/10 rounded-2xl p-2 shadow-2xl z-50">
-                  <p className="text-[8px] font-black uppercase tracking-[0.2em] text-white/30 px-3 py-2">Auto-Delete Protocol</p>
-                  {[
-                    { id: "none", label: "No Auto-Delete" }, 
-                    { id: "view", label: "Delete After View" }, 
-                    { id: "1m", label: "1 Minute" },
-                    { id: "3h", label: "3 Hours" }
-                  ].map(opt => (
-                    <button key={opt.id} onClick={() => { setAutoDeleteMode(opt.id as any); setShowMenu(false); }} className={`w-full text-left px-3 py-2 rounded-xl text-[10px] font-bold uppercase tracking-widest transition-all ${autoDeleteMode === opt.id ? 'bg-indigo-600 text-white' : 'text-white/60 hover:bg-white/5'}`}>
-                      {opt.label}
-                    </button>
-                  ))}
-                </motion.div>
-              )}</AnimatePresence>
+                <AnimatePresence>{showMenu && (<motion.div initial={{ opacity: 0, y: 10, scale: 0.95 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 10, scale: 0.95 }} className="absolute right-0 top-12 w-48 bg-zinc-900 border border-white/10 rounded-2xl p-2 shadow-2xl z-50"><p className="text-[8px] font-black uppercase tracking-[0.2em] text-white/30 px-3 py-2">Auto-Delete Protocol</p>{[{ id: "none", label: "No Auto-Delete" }, { id: "view", label: "Delete After View" }, { id: "1m", label: "Delete After 1 Minute" }, { id: "3h", label: "Delete After 3 Hours" }].map(opt => (<button key={opt.id} onClick={() => { setAutoDeleteMode(opt.id as any); setShowMenu(false); }} className={`w-full text-left px-3 py-2 rounded-xl text-[10px] font-bold uppercase tracking-widest transition-all ${autoDeleteMode === opt.id ? 'bg-indigo-600 text-white' : 'text-white/60 hover:bg-white/5'}`}>{opt.label}</button>))}</motion.div>)}</AnimatePresence>
             </div>
           </div>
       </header>
 
-      <div className="flex-1 overflow-y-auto custom-scrollbar p-6 space-y-6 relative">
-        {loading ? (
-          <div className="flex items-center justify-center h-full">
-            <div className="animate-spin border-2 border-indigo-500 border-t-transparent rounded-full w-8 h-8" />
-          </div>
-        ) : messages.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-full opacity-20">
-            <ShieldCheck className="w-12 h-12 mb-4" />
-            <p className="text-[10px] font-black uppercase tracking-[0.4em]">End-to-End Encrypted</p>
-          </div>
-        ) : (
+      <div className="flex-1 overflow-y-auto custom-scrollbar p-6 space-y-6">
+        {loading ? (<div className="flex items-center justify-center h-full animate-spin border-2 border-indigo-500 border-t-transparent rounded-full w-8 h-8 mx-auto" />) : messages.length === 0 ? (<div className="flex flex-col items-center justify-center h-full opacity-20"><ShieldCheck className="w-12 h-12 mb-4" /><p className="text-[10px] font-black uppercase tracking-[0.4em]">End-to-End Encrypted</p></div>) : (
           messages.map((msg) => {
             const isMe = msg.sender_id === session.user.id;
             return (
               <motion.div key={msg.id} initial={{ opacity: 0, x: isMe ? 20 : -20 }} animate={{ opacity: 1, x: 0 }} className={`flex ${isMe ? "justify-end" : "justify-start"}`}>
                 <div className={`max-w-[80%] flex flex-col ${isMe ? "items-end" : "items-start"} relative`}>
                   {msg.media_type === 'snapshot' ? (
-                    <button onClick={() => openSnapshot(msg)} className="p-4 rounded-[2rem] border bg-purple-600/10 border-purple-500/30 flex items-center gap-3">
-                      <Camera className="w-5 h-5 text-purple-400" />
-                      <span className="text-[10px] font-black uppercase text-white">Snapshot</span>
-                    </button>
+                    <button onClick={() => openSnapshot(msg)} className="p-4 rounded-[2rem] border bg-purple-600/10 border-purple-500/30 flex items-center gap-3"><Camera className="w-5 h-5 text-purple-400" /><span className="text-[10px] font-black uppercase text-white">Snapshot</span></button>
                   ) : msg.media_type === 'image' ? (
                     <img src={msg.media_url} alt="" className="rounded-[2rem] border border-white/10 max-h-80" />
                   ) : (
-                    <div className={`p-5 rounded-[2rem] text-sm font-medium ${msg.is_saved ? "bg-amber-100 text-amber-900 border border-amber-400" : isMe ? "bg-indigo-600 text-white shadow-xl" : "bg-white/[0.03] border border-white/5 text-white/90"}`}>
-                      {msg.decrypted_content || "[Encrypted Signal]"}
-                    </div>
+                    <div className={`p-5 rounded-[2rem] text-sm font-medium ${msg.is_saved ? "bg-amber-100 text-amber-900 border border-amber-400" : isMe ? "bg-indigo-600 text-white shadow-xl" : "bg-white/[0.03] border border-white/5 text-white/90"}`}>{msg.decrypted_content || "[Encrypted Signal]"}</div>
                   )}
-                  <div className="flex items-center gap-2 mt-2 px-2">
-                    <span className="text-[7px] font-black uppercase tracking-widest text-white/10">
-                      {new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                    </span>
-                    {isMe && (
-                      <div className="flex items-center">
-                        {msg.is_viewed ? (
-                          <CheckCheck className="w-2.5 h-2.5 text-blue-500" />
-                        ) : msg.is_delivered ? (
-                          <CheckCheck className="w-2.5 h-2.5 text-white/90" />
-                        ) : (
-                          <Check className="w-2.5 h-2.5 text-white/40" />
-                        )}
-                      </div>
-                    )}
-                  </div>
+                  <div className="flex items-center gap-2 mt-2 px-2"><span className="text-[7px] font-black uppercase tracking-widest text-white/10">{new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>{isMe && (<div className="flex items-center">{msg.is_viewed ? (<CheckCheck className="w-2.5 h-2.5 text-blue-500" />) : (<CheckCheck className="w-2.5 h-2.5 text-white/90" />)}</div>)}</div>
                 </div>
               </motion.div>
             );
           })
         )}
-        <div ref={messagesEndRef} />
-        
-        {/* Presence / Typing Ball (Left Bottom) */}
-        {(partnerInChat || partnerTyping) && (
-          <motion.div 
-            initial={{ opacity: 0, scale: 0 }}
-            animate={{ opacity: 1, scale: 1 }}
-            className="absolute bottom-6 left-6 z-30 flex items-center gap-3"
-          >
-            <motion.div 
-              animate={partnerTyping ? { 
-                y: [0, -10, 0],
-                scale: [1, 1.2, 1]
-              } : {}}
-              transition={{ repeat: Infinity, duration: 0.6 }}
-              className="w-4 h-4 rounded-full bg-indigo-500 shadow-[0_0_15px_rgba(99,102,241,0.8)]"
-            />
-            {partnerTyping && (
-              <span className="text-[9px] font-black uppercase tracking-widest text-indigo-400 animate-pulse">
-                Typing Signal...
-              </span>
+          <AnimatePresence>
+            {partnerIsTyping && (
+              <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 10 }} className="flex justify-start items-center gap-3">
+                <AvatarDisplay profile={initialContact} className="h-6 w-6" />
+                <div className="bg-white/[0.03] border border-white/5 px-4 py-2 rounded-2xl flex items-center gap-1">
+                  <motion.div animate={{ y: [0, -5, 0] }} transition={{ duration: 0.6, repeat: Infinity }} className="w-1.5 h-1.5 bg-indigo-500 rounded-full" />
+                  <motion.div animate={{ y: [0, -5, 0] }} transition={{ duration: 0.6, repeat: Infinity, delay: 0.1 }} className="w-1.5 h-1.5 bg-indigo-500 rounded-full" />
+                  <motion.div animate={{ y: [0, -5, 0] }} transition={{ duration: 0.6, repeat: Infinity, delay: 0.2 }} className="w-1.5 h-1.5 bg-indigo-500 rounded-full" />
+                </div>
+              </motion.div>
             )}
-          </motion.div>
-        )}
-      </div>
+          </AnimatePresence>
+          <div ref={messagesEndRef} />
+        </div>
 
       <footer className="p-6 bg-black/40 backdrop-blur-3xl border-t border-white/5 shrink-0">
           <div className="flex items-center gap-3 relative">
-            <Button variant="ghost" size="icon" onClick={() => setShowOptions(!showOptions)} className={`h-12 w-12 rounded-2xl transition-all ${showOptions ? 'bg-indigo-600 text-white rotate-45' : 'bg-white/5 text-white/20'}`}>
-              <Plus className="w-6 h-6" />
-            </Button>
-            <input 
-              value={newMessage} 
-              onChange={(e) => onInputChange(e.target.value)} 
-              onKeyDown={(e) => e.key === "Enter" && sendMessage()} 
-              placeholder="Type signal packet..." 
-              className="flex-1 bg-white/[0.03] border border-white/10 rounded-[2rem] h-12 px-6 text-sm outline-none focus:border-indigo-500/50" 
-            />
-            <Button 
-              onClick={() => sendMessage()} 
-              disabled={!newMessage.trim()} 
-              className="h-12 w-12 rounded-2xl bg-indigo-600 hover:bg-indigo-500 shadow-lg shadow-indigo-600/20 disabled:opacity-20"
-            >
-              <Send className="w-5 h-5" />
-            </Button>
-            
-            <AnimatePresence>
-              {showOptions && (
-                <motion.div initial={{ opacity: 0, y: 10, scale: 0.9 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 10, scale: 0.9 }} className="absolute bottom-20 left-0 w-64 bg-[#0a0a0a] border border-white/10 rounded-[2.5rem] p-4 shadow-2xl z-50 overflow-hidden">
-                  <div className="grid grid-cols-2 gap-2">
-                    <label className="flex flex-col items-center justify-center p-4 bg-white/[0.02] border border-white/5 rounded-2xl cursor-pointer">
-                      <ImageIcon className="w-6 h-6 text-indigo-400 mb-2" />
-                      <span className="text-[8px] font-black uppercase text-white/40">Photo</span>
-                      <input type="file" className="hidden" accept="image/*" onChange={(e) => handleFileUpload(e, "image")} />
-                    </label>
-                    <button onClick={() => startCamera()} className="flex flex-col items-center justify-center p-4 bg-purple-600/5 border border-purple-500/20 rounded-2xl">
-                      <Camera className="w-6 h-6 text-purple-400 mb-2" />
-                      <span className="text-[8px] font-black uppercase text-white/40">Snapshot</span>
-                    </button>
-                  </div>
-                </motion.div>
-              )}
-            </AnimatePresence>
+            <Button variant="ghost" size="icon" onClick={() => setShowOptions(!showOptions)} className={`h-12 w-12 rounded-2xl transition-all ${showOptions ? 'bg-indigo-600 text-white rotate-45' : 'bg-white/5 text-white/20'}`}><Plus className="w-6 h-6" /></Button>
+            <input value={newMessage} onChange={(e) => setNewMessage(e.target.value)} onKeyDown={(e) => e.key === "Enter" && sendMessage()} placeholder="Type signal packet..." className="flex-1 bg-white/[0.03] border border-white/10 rounded-[2rem] h-12 px-6 text-sm outline-none focus:border-indigo-500/50" />
+            <Button onClick={() => sendMessage()} disabled={!newMessage.trim()} className="h-12 w-12 rounded-2xl bg-indigo-600 hover:bg-indigo-500 shadow-lg shadow-indigo-600/20 disabled:opacity-20"><Send className="w-5 h-5" /></Button>
+            <AnimatePresence>{showOptions && (<motion.div initial={{ opacity: 0, y: 10, scale: 0.9 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 10, scale: 0.9 }} className="absolute bottom-20 left-0 w-64 bg-[#0a0a0a] border border-white/10 rounded-[2.5rem] p-4 shadow-2xl z-50 overflow-hidden"><div className="grid grid-cols-2 gap-2"><label className="flex flex-col items-center justify-center p-4 bg-white/[0.02] border border-white/5 rounded-2xl cursor-pointer"><ImageIcon className="w-6 h-6 text-indigo-400 mb-2" /><span className="text-[8px] font-black uppercase text-white/40">Photo</span><input type="file" className="hidden" accept="image/*" onChange={(e) => handleFileUpload(e, "image")} /></label><button onClick={() => startCamera()} className="flex flex-col items-center justify-center p-4 bg-purple-600/5 border border-purple-500/20 rounded-2xl"><Camera className="w-6 h-6 text-purple-400 mb-2" /><span className="text-[8px] font-black uppercase text-white/40">Snapshot</span></button></div></motion.div>)}</AnimatePresence>
           </div>
       </footer>
 
-      <AnimatePresence>{showCamera && (
-        <div className="fixed inset-0 z-[150] bg-black flex flex-col items-center justify-center">
-          <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-cover" />
-          <div className="absolute bottom-10 flex gap-6 items-center">
-            <Button onClick={() => setShowCamera(false)} variant="ghost" className="bg-white/10 hover:bg-white/20 rounded-full h-14 w-14">
-              <X className="w-6 h-6 text-white" />
-            </Button>
-            <button onClick={capturePhoto} className="w-20 h-20 rounded-full border-4 border-white flex items-center justify-center">
-              <div className="w-14 h-14 rounded-full bg-white" />
-            </button>
-          </div>
-        </div>
-      )}</AnimatePresence>
+      <AnimatePresence>{showCamera && (<div className="fixed inset-0 z-[150] bg-black flex flex-col items-center justify-center"><video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-cover" /><div className="absolute bottom-10 flex gap-6 items-center"><Button onClick={() => setShowCamera(false)} variant="ghost" className="bg-white/10 hover:bg-white/20 rounded-full h-14 w-14"><X className="w-6 h-6 text-white" /></Button><button onClick={capturePhoto} className="w-20 h-20 rounded-full border-4 border-white flex items-center justify-center"><div className="w-14 h-14 rounded-full bg-white" /></button></div></div>)}</AnimatePresence>
 
-      <AnimatePresence>{showSnapshotView && (
-        <motion.div initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.9 }} className="fixed inset-0 z-[100] bg-black backdrop-blur-3xl flex items-center justify-center p-3 sm:p-6">
-          <div className="relative w-full max-w-2xl bg-black rounded-[2rem] overflow-hidden border border-white/10 flex flex-col">
-            <img src={showSnapshotView.media_url} alt="" className="w-full h-full object-contain" />
-            <button onClick={closeSnapshot} className="absolute top-4 right-4 w-12 h-12 bg-black/50 backdrop-blur-md rounded-full flex items-center justify-center border border-white/10">
-              <X className="w-6 h-6 text-white" />
-            </button>
-          </div>
-        </motion.div>
-      )}</AnimatePresence>
+      <AnimatePresence>{showSnapshotView && (<motion.div initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.9 }} className="fixed inset-0 z-[100] bg-black backdrop-blur-3xl flex items-center justify-center p-3 sm:p-6"><div className="relative w-full max-w-2xl bg-black rounded-[2rem] overflow-hidden border border-white/10 flex flex-col"><img src={showSnapshotView.media_url} alt="" className="w-full h-full object-contain" /><button onClick={closeSnapshot} className="absolute top-4 right-4 w-12 h-12 bg-black/50 backdrop-blur-md rounded-full flex items-center justify-center border border-white/10"><X className="w-6 h-6 text-white" /></button></div></motion.div>)}</AnimatePresence>
     </div>
   );
 }
