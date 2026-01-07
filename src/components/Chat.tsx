@@ -114,16 +114,23 @@ export function Chat({ session, privateKey, initialContact, isPartnerOnline, onB
     initMyPublicKey();
   }, [session.user.id]);
 
-  const decryptMessageContent = async (msg: any) => {
+  const decryptMessageContent = async (msg: any): Promise<{ text: string; isEncrypted: boolean }> => {
     try {
+      if (!msg.encrypted_content) return { text: "", isEncrypted: false };
       const packet = JSON.parse(msg.encrypted_content);
-      if (!packet.iv || !packet.content || !packet.keys) return msg.encrypted_content;
+      if (!packet.iv || !packet.content || !packet.keys) {
+        return { text: msg.encrypted_content, isEncrypted: false };
+      }
       const encryptedAESKey = packet.keys[session.user.id];
-      if (!encryptedAESKey) return "[Encryption Error: Key Missing]";
+      if (!encryptedAESKey) {
+        return { text: "", isEncrypted: true };
+      }
       const aesKey = await decryptAESKeyWithUserPrivateKey(encryptedAESKey, privateKey);
-      return await decryptWithAES(packet.content, packet.iv, aesKey);
+      const decrypted = await decryptWithAES(packet.content, packet.iv, aesKey);
+      return { text: decrypted, isEncrypted: false };
     } catch (e) {
-      return msg.encrypted_content;
+      console.error("Decryption error:", e);
+      return { text: "", isEncrypted: true };
     }
   };
 
@@ -131,7 +138,10 @@ export function Chat({ session, privateKey, initialContact, isPartnerOnline, onB
     setLoading(true);
     const { data, error } = await supabase.from("messages").select("*").or(`and(sender_id.eq.${session.user.id},receiver_id.eq.${initialContact.id}),and(sender_id.eq.${initialContact.id},receiver_id.eq.${session.user.id})`).order("created_at", { ascending: true });
     if (!error) {
-      const decryptedMessages = await Promise.all((data || []).map(async msg => ({ ...msg, decrypted_content: await decryptMessageContent(msg) })));
+      const decryptedMessages = await Promise.all((data || []).map(async msg => {
+        const result = await decryptMessageContent(msg);
+        return { ...msg, decrypted_content: result.text, is_encrypted_display: result.isEncrypted };
+      }));
       setMessages(decryptedMessages);
       const unviewed = data?.filter(m => m.receiver_id === session.user.id && !m.is_viewed) || [];
       if (unviewed.length > 0) {
@@ -144,8 +154,8 @@ export function Chat({ session, privateKey, initialContact, isPartnerOnline, onB
   function subscribeToMessages() {
     return supabase.channel(`chat-${initialContact.id}`).on("postgres_changes", { event: "INSERT", schema: "public", table: "messages", filter: `receiver_id=eq.${session.user.id}` }, async (payload) => {
       if (payload.new.sender_id === initialContact.id) {
-        const decryptedContent = await decryptMessageContent(payload.new);
-        const msg = { ...payload.new, decrypted_content: decryptedContent };
+        const result = await decryptMessageContent(payload.new);
+        const msg = { ...payload.new, decrypted_content: result.text, is_encrypted_display: result.isEncrypted };
         setMessages(prev => [...prev, msg]);
         await supabase.from("messages").update({ is_delivered: true, delivered_at: new Date().toISOString() }).eq("id", payload.new.id);
         if (payload.new.media_type === 'snapshot') {
@@ -154,8 +164,8 @@ export function Chat({ session, privateKey, initialContact, isPartnerOnline, onB
         }
       }
     }).on("postgres_changes", { event: "UPDATE", schema: "public", table: "messages" }, async (payload) => {
-      const decryptedContent = await decryptMessageContent(payload.new);
-      setMessages(prev => prev.map(m => m.id === payload.new.id ? { ...payload.new, decrypted_content: decryptedContent } : m));
+      const result = await decryptMessageContent(payload.new);
+      setMessages(prev => prev.map(m => m.id === payload.new.id ? { ...payload.new, decrypted_content: result.text, is_encrypted_display: result.isEncrypted } : m));
     }).subscribe();
   }
 
@@ -181,13 +191,14 @@ export function Chat({ session, privateKey, initialContact, isPartnerOnline, onB
       const messageData: any = { sender_id: session.user.id, receiver_id: initialContact.id, encrypted_content: packet, media_type: mediaType, media_url: mediaUrl, is_viewed: false, is_delivered: partnerPresence.isOnline, expires_at: autoDeleteMode === "3h" ? new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString() : null, is_view_once: autoDeleteMode === "view" };
       if (mediaType === 'snapshot') { messageData.view_count = 0; messageData.is_view_once = true; }
       const { data, error } = await supabase.from("messages").insert(messageData).select();
-      if (!error) {
-        const sentMsg = data?.[0] || messageData;
-        sentMsg.decrypted_content = contentToEncrypt;
-        setMessages(prev => [...prev, sentMsg]);
-        setNewMessage("");
-        setShowOptions(false);
-      }
+        if (!error) {
+          const sentMsg = data?.[0] || messageData;
+          sentMsg.decrypted_content = contentToEncrypt;
+          sentMsg.is_encrypted_display = false;
+          setMessages(prev => [...prev, sentMsg]);
+          setNewMessage("");
+          setShowOptions(false);
+        }
     } catch (e) { toast.error("Encryption failed"); }
   }
 
@@ -269,27 +280,34 @@ export function Chat({ session, privateKey, initialContact, isPartnerOnline, onB
       </header>
 
       <div className="flex-1 overflow-y-auto custom-scrollbar p-6 space-y-6">
-        {loading ? (<div className="flex items-center justify-center h-full animate-spin border-2 border-indigo-500 border-t-transparent rounded-full w-8 h-8 mx-auto" />) : messages.length === 0 ? (<div className="flex flex-col items-center justify-center h-full opacity-20"><ShieldCheck className="w-12 h-12 mb-4" /><p className="text-[10px] font-black uppercase tracking-[0.4em]">End-to-End Encrypted</p></div>) : (
-          messages.map((msg) => {
-            const isMe = msg.sender_id === session.user.id;
-            return (
-              <motion.div key={msg.id} initial={{ opacity: 0, x: isMe ? 20 : -20 }} animate={{ opacity: 1, x: 0 }} className={`flex ${isMe ? "justify-end" : "justify-start"}`}>
-                <div className={`max-w-[80%] flex flex-col ${isMe ? "items-end" : "items-start"} relative`}>
-                  {msg.media_type === 'snapshot' ? (
-                    <button onClick={() => openSnapshot(msg)} className="p-4 rounded-[2rem] border bg-purple-600/10 border-purple-500/30 flex items-center gap-3"><Camera className="w-5 h-5 text-purple-400" /><span className="text-[10px] font-black uppercase text-white">Snapshot</span></button>
-                  ) : msg.media_type === 'image' ? (
-                    <img src={msg.media_url} alt="" className="rounded-[2rem] border border-white/10 max-h-80" />
-                  ) : (
-                    <div className={`p-5 rounded-[2rem] text-sm font-medium ${msg.is_saved ? "bg-amber-100 text-amber-900 border border-amber-400" : isMe ? "bg-indigo-600 text-white shadow-xl" : "bg-white/[0.03] border border-white/5 text-white/90"}`}>{msg.decrypted_content || "[Encrypted Signal]"}</div>
-                  )}
-                  <div className="flex items-center gap-2 mt-2 px-2"><span className="text-[7px] font-black uppercase tracking-widest text-white/10">{new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>{isMe && (<div className="flex items-center">{msg.is_viewed ? (<CheckCheck className="w-2.5 h-2.5 text-blue-500" />) : (<CheckCheck className="w-2.5 h-2.5 text-white/90" />)}</div>)}</div>
-                </div>
-              </motion.div>
-            );
-          })
-        )}
-        <div ref={messagesEndRef} />
-      </div>
+          {loading ? (<div className="flex items-center justify-center h-full animate-spin border-2 border-indigo-500 border-t-transparent rounded-full w-8 h-8 mx-auto" />) : messages.length === 0 ? (<div className="flex flex-col items-center justify-center h-full opacity-20"><ShieldCheck className="w-12 h-12 mb-4" /><p className="text-[10px] font-black uppercase tracking-[0.4em]">End-to-End Encrypted</p></div>) : (
+            messages.map((msg) => {
+              const isMe = msg.sender_id === session.user.id;
+              const hasDecryptedContent = msg.decrypted_content && msg.decrypted_content.trim() !== "";
+              const showEncrypted = msg.is_encrypted_display === true;
+              return (
+                <motion.div key={msg.id} initial={{ opacity: 0, x: isMe ? 20 : -20 }} animate={{ opacity: 1, x: 0 }} className={`flex ${isMe ? "justify-end" : "justify-start"}`}>
+                  <div className={`max-w-[80%] flex flex-col ${isMe ? "items-end" : "items-start"} relative`}>
+                    {msg.media_type === 'snapshot' ? (
+                      <button onClick={() => openSnapshot(msg)} className="p-4 rounded-[2rem] border bg-purple-600/10 border-purple-500/30 flex items-center gap-3"><Camera className="w-5 h-5 text-purple-400" /><span className="text-[10px] font-black uppercase text-white">Snapshot</span></button>
+                    ) : msg.media_type === 'image' ? (
+                      <img src={msg.media_url} alt="" className="rounded-[2rem] border border-white/10 max-h-80" />
+                    ) : showEncrypted && !hasDecryptedContent ? (
+                      <div className="p-5 rounded-[2rem] text-sm font-medium bg-zinc-800/50 border border-zinc-700/50 text-zinc-400 flex items-center gap-3">
+                        <Lock className="w-4 h-4" />
+                        <span className="text-[10px] font-black uppercase tracking-wider">Encrypted Signal</span>
+                      </div>
+                    ) : (
+                      <div className={`p-5 rounded-[2rem] text-sm font-medium ${msg.is_saved ? "bg-amber-100 text-amber-900 border border-amber-400" : isMe ? "bg-indigo-600 text-white shadow-xl" : "bg-white/[0.03] border border-white/5 text-white/90"}`}>{msg.decrypted_content}</div>
+                    )}
+                    <div className="flex items-center gap-2 mt-2 px-2"><span className="text-[7px] font-black uppercase tracking-widest text-white/10">{new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>{isMe && (<div className="flex items-center">{msg.is_viewed ? (<CheckCheck className="w-2.5 h-2.5 text-blue-500" />) : (<CheckCheck className="w-2.5 h-2.5 text-white/90" />)}</div>)}</div>
+                  </div>
+                </motion.div>
+              );
+            })
+          )}
+          <div ref={messagesEndRef} />
+        </div>
 
       <footer className="p-6 bg-black/40 backdrop-blur-3xl border-t border-white/5 shrink-0">
           <div className="flex items-center gap-3 relative">
