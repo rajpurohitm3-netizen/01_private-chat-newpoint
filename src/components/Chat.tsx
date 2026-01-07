@@ -61,6 +61,63 @@ export function Chat({ session, privateKey, initialContact, isPartnerOnline, onB
   const [contactProfile, setContactProfile] = useState<any>(initialContact);
   const [myPublicKey, setMyPublicKey] = useState<CryptoKey | null>(null);
   const [partnerPresence, setPartnerPresence] = useState<{isOnline: boolean; isInChat: boolean; isTyping: boolean;}>({ isOnline: false, isInChat: false, isTyping: false });
+  const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  useEffect(() => {
+    const channelId = [session.user.id, initialContact.id].sort().join("-");
+    const channel = supabase.channel(`presence-${channelId}`);
+
+    channel
+      .on("presence", { event: "sync" }, () => {
+        const state = channel.presenceState();
+        const isInChat = Object.values(state).some((presences: any) => 
+          presences.some((p: any) => p.user_id === initialContact.id)
+        );
+        setPartnerPresence(prev => ({ ...prev, isInChat }));
+      })
+      .on("broadcast", { event: "typing" }, ({ payload }) => {
+        if (payload.user_id === initialContact.id) {
+          setPartnerPresence(prev => ({ ...prev, isTyping: payload.isTyping }));
+        }
+      })
+      .subscribe(async (status) => {
+        if (status === "SUBSCRIBED") {
+          await channel.track({
+            user_id: session.user.id,
+            online_at: new Date().toISOString(),
+          });
+        }
+      });
+
+    return () => {
+      channel.unsubscribe();
+    };
+  }, [initialContact.id, session.user.id]);
+
+  useEffect(() => {
+    setPartnerPresence(prev => ({ ...prev, isOnline: !!isPartnerOnline }));
+  }, [isPartnerOnline]);
+
+  const handleTyping = () => {
+    const channelId = [session.user.id, initialContact.id].sort().join("-");
+    const channel = supabase.channel(`presence-${channelId}`);
+    
+    channel.send({
+      type: "broadcast",
+      event: "typing",
+      payload: { user_id: session.user.id, isTyping: true },
+    });
+
+    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+    
+    typingTimeoutRef.current = setTimeout(() => {
+      channel.send({
+        type: "broadcast",
+        event: "typing",
+        payload: { user_id: session.user.id, isTyping: false },
+      });
+    }, 3000);
+  };
   const [isFocused, setIsFocused] = useState(true);
   const [showSnapshotView, setShowSnapshotView] = useState<any>(null);
   const [showSaveToVault, setShowSaveToVault] = useState<any>(null);
@@ -116,28 +173,14 @@ export function Chat({ session, privateKey, initialContact, isPartnerOnline, onB
 
   const decryptMessageContent = async (msg: any) => {
     try {
-      if (!msg.encrypted_content) return "";
-      
-      // If it doesn't look like JSON, it's likely a legacy cleartext message
-      if (!msg.encrypted_content.trim().startsWith("{")) {
-        return msg.encrypted_content;
-      }
-
       const packet = JSON.parse(msg.encrypted_content);
       if (!packet.iv || !packet.content || !packet.keys) return msg.encrypted_content;
-      
-      const userId = session.user.id;
-      const encryptedAESKey = packet.keys[userId];
-      
-      if (!encryptedAESKey) {
-        return "[Encrypted Signal]";
-      }
-      
+      const encryptedAESKey = packet.keys[session.user.id];
+      if (!encryptedAESKey) return "[Encryption Error: Key Missing]";
       const aesKey = await decryptAESKeyWithUserPrivateKey(encryptedAESKey, privateKey);
       return await decryptWithAES(packet.content, packet.iv, aesKey);
     } catch (e) {
-      console.error("Decryption error:", e);
-      return "[Encrypted Signal]";
+      return msg.encrypted_content;
     }
   };
 
@@ -155,40 +198,23 @@ export function Chat({ session, privateKey, initialContact, isPartnerOnline, onB
     setLoading(false);
   }
 
-    function subscribeToMessages() {
-      return supabase.channel(`chat-${initialContact.id}`).on("postgres_changes", { event: "INSERT", schema: "public", table: "messages", filter: `receiver_id=eq.${session.user.id}` }, async (payload) => {
-        if (payload.new.sender_id === initialContact.id) {
-          const decryptedContent = await decryptMessageContent(payload.new);
-          const msg = { ...payload.new, decrypted_content: decryptedContent };
-          setMessages(prev => {
-            if (prev.find(m => m.id === msg.id)) return prev;
-            return [...prev, msg];
-          });
-          await supabase.from("messages").update({ is_delivered: true, delivered_at: new Date().toISOString() }).eq("id", payload.new.id);
-          if (payload.new.media_type === 'snapshot') {
-            toast.info("Snapshot Received");
-            setShowSnapshotView(msg);
-          }
+  function subscribeToMessages() {
+    return supabase.channel(`chat-${initialContact.id}`).on("postgres_changes", { event: "INSERT", schema: "public", table: "messages", filter: `receiver_id=eq.${session.user.id}` }, async (payload) => {
+      if (payload.new.sender_id === initialContact.id) {
+        const decryptedContent = await decryptMessageContent(payload.new);
+        const msg = { ...payload.new, decrypted_content: decryptedContent };
+        setMessages(prev => [...prev, msg]);
+        await supabase.from("messages").update({ is_delivered: true, delivered_at: new Date().toISOString() }).eq("id", payload.new.id);
+        if (payload.new.media_type === 'snapshot') {
+          toast.info("Snapshot Received");
+          setShowSnapshotView(msg);
         }
-      }).on("postgres_changes", { event: "UPDATE", schema: "public", table: "messages" }, async (payload) => {
-        // Only update if the message is already in our list
-        setMessages(prev => {
-          const existing = prev.find(m => m.id === payload.new.id);
-          if (!existing) return prev;
-          
-          // Only re-decrypt if encrypted_content changed
-          if (existing.encrypted_content !== payload.new.encrypted_content) {
-            decryptMessageContent(payload.new).then(decryptedContent => {
-              setMessages(current => current.map(m => m.id === payload.new.id ? { ...payload.new, decrypted_content: decryptedContent } : m));
-            });
-            return prev; // Decryption will happen asynchronously
-          }
-          
-          return prev.map(m => m.id === payload.new.id ? { ...m, ...payload.new, decrypted_content: existing.decrypted_content } : m);
-        });
-      }).subscribe();
-    }
-
+      }
+    }).on("postgres_changes", { event: "UPDATE", schema: "public", table: "messages" }, async (payload) => {
+      const decryptedContent = await decryptMessageContent(payload.new);
+      setMessages(prev => prev.map(m => m.id === payload.new.id ? { ...payload.new, decrypted_content: decryptedContent } : m));
+    }).subscribe();
+  }
 
   useEffect(() => {
     fetchMessages();
@@ -202,19 +228,10 @@ export function Chat({ session, privateKey, initialContact, isPartnerOnline, onB
     if (!newMessage.trim() && !mediaUrl) return;
     if (!myPublicKey || !initialContact.public_key) { toast.error("Encryption keys not synchronized."); return; }
     try {
-      // Fetch latest partner public key to ensure we use the correct one
-      const { data: latestProfile } = await supabase.from("profiles").select("public_key").eq("id", initialContact.id).single();
-      const targetPublicKey = latestProfile?.public_key || initialContact.public_key;
-      
-      if (!targetPublicKey) {
-        toast.error("Partner's encryption key is not available.");
-        return;
-      }
-
       const aesKey = await generateAESKey();
       const contentToEncrypt = newMessage.trim() || " ";
       const encrypted = await encryptWithAES(contentToEncrypt, aesKey);
-      const partnerKey = await importPublicKey(targetPublicKey);
+      const partnerKey = await importPublicKey(initialContact.public_key);
       const encryptedKeyForPartner = await encryptAESKeyForUser(aesKey, partnerKey);
       const encryptedKeyForMe = await encryptAESKeyForUser(aesKey, myPublicKey);
       const packet = JSON.stringify({ iv: encrypted.iv, content: encrypted.content, keys: { [session.user.id]: encryptedKeyForMe, [initialContact.id]: encryptedKeyForPartner } });
@@ -315,41 +332,61 @@ export function Chat({ session, privateKey, initialContact, isPartnerOnline, onB
             return (
               <motion.div key={msg.id} initial={{ opacity: 0, x: isMe ? 20 : -20 }} animate={{ opacity: 1, x: 0 }} className={`flex ${isMe ? "justify-end" : "justify-start"}`}>
                 <div className={`max-w-[80%] flex flex-col ${isMe ? "items-end" : "items-start"} relative`}>
-                    {msg.media_type === 'snapshot' ? (
-                      <button onClick={() => openSnapshot(msg)} className="p-4 rounded-[2rem] border bg-purple-600/10 border-purple-500/30 flex items-center gap-3"><Camera className="w-5 h-5 text-purple-400" /><span className="text-[10px] font-black uppercase text-white">Snapshot</span></button>
-                    ) : msg.media_type === 'image' ? (
-                      <img src={msg.media_url} alt="" className="rounded-[2rem] border border-white/10 max-h-80" />
-                    ) : (
-                      <div className={`p-5 rounded-[2rem] text-sm font-medium relative group ${msg.is_saved ? "bg-amber-100 text-amber-900 border border-amber-400" : isMe ? "bg-indigo-600 text-white shadow-xl" : "bg-white/[0.03] border border-white/5 text-white/90"}`}>
-                        {msg.decrypted_content === "[Encrypted Signal]" ? (
-                          <div className="flex items-center gap-2 opacity-40">
-                            <Lock className="w-3 h-3" />
-                            <span className="italic">[Encrypted Signal]</span>
-                          </div>
-                        ) : (
-                          msg.decrypted_content || msg.encrypted_content
-                        )}
-                        {!isMe && msg.decrypted_content && msg.decrypted_content !== "[Encrypted Signal]" && (
-                          <div className="absolute -left-8 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity">
-                            <ShieldCheck className="w-4 h-4 text-emerald-500" />
-                          </div>
-                        )}
-                      </div>
-                    )}
-
+                  {msg.media_type === 'snapshot' ? (
+                    <button onClick={() => openSnapshot(msg)} className="p-4 rounded-[2rem] border bg-purple-600/10 border-purple-500/30 flex items-center gap-3"><Camera className="w-5 h-5 text-purple-400" /><span className="text-[10px] font-black uppercase text-white">Snapshot</span></button>
+                  ) : msg.media_type === 'image' ? (
+                    <img src={msg.media_url} alt="" className="rounded-[2rem] border border-white/10 max-h-80" />
+                  ) : (
+                    <div className={`p-5 rounded-[2rem] text-sm font-medium ${msg.is_saved ? "bg-amber-100 text-amber-900 border border-amber-400" : isMe ? "bg-indigo-600 text-white shadow-xl" : "bg-white/[0.03] border border-white/5 text-white/90"}`}>{msg.decrypted_content || "[Encrypted Signal]"}</div>
+                  )}
                   <div className="flex items-center gap-2 mt-2 px-2"><span className="text-[7px] font-black uppercase tracking-widest text-white/10">{new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>{isMe && (<div className="flex items-center">{msg.is_viewed ? (<CheckCheck className="w-2.5 h-2.5 text-blue-500" />) : (<CheckCheck className="w-2.5 h-2.5 text-white/90" />)}</div>)}</div>
                 </div>
               </motion.div>
             );
           })
         )}
-        <div ref={messagesEndRef} />
-      </div>
+          <div ref={messagesEndRef} />
+        </div>
 
-      <footer className="p-6 bg-black/40 backdrop-blur-3xl border-t border-white/5 shrink-0">
+        <AnimatePresence>
+          {partnerPresence.isInChat && (
+            <motion.div 
+              initial={{ opacity: 0, x: -20 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: -20 }}
+              className="absolute bottom-32 left-8 z-30 pointer-events-none"
+            >
+              <div className="flex items-center gap-3">
+                <motion.div
+                  animate={partnerPresence.isTyping ? {
+                    y: [0, -8, 0],
+                  } : {}}
+                  transition={{
+                    duration: 0.6,
+                    repeat: Infinity,
+                    ease: "easeInOut"
+                  }}
+                  className="w-3 h-3 bg-indigo-500 rounded-full shadow-[0_0_15px_rgba(99,102,241,0.6)]"
+                />
+                {partnerPresence.isTyping && (
+                  <motion.span 
+                    initial={{ opacity: 0, x: -10 }}
+                    animate={{ opacity: 1, x: 0 }}
+                    className="text-[8px] font-black uppercase tracking-[0.2em] text-indigo-400 bg-indigo-500/10 px-2 py-1 rounded-md border border-indigo-500/20"
+                  >
+                    Typing...
+                  </motion.span>
+                )}
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        <footer className="p-6 bg-black/40 backdrop-blur-3xl border-t border-white/5 shrink-0">
+
           <div className="flex items-center gap-3 relative">
             <Button variant="ghost" size="icon" onClick={() => setShowOptions(!showOptions)} className={`h-12 w-12 rounded-2xl transition-all ${showOptions ? 'bg-indigo-600 text-white rotate-45' : 'bg-white/5 text-white/20'}`}><Plus className="w-6 h-6" /></Button>
-            <input value={newMessage} onChange={(e) => setNewMessage(e.target.value)} onKeyDown={(e) => e.key === "Enter" && sendMessage()} placeholder="Type signal packet..." className="flex-1 bg-white/[0.03] border border-white/10 rounded-[2rem] h-12 px-6 text-sm outline-none focus:border-indigo-500/50" />
+            <input value={newMessage} onChange={(e) => { setNewMessage(e.target.value); handleTyping(); }} onKeyDown={(e) => e.key === "Enter" && sendMessage()} placeholder="Type signal packet..." className="flex-1 bg-white/[0.03] border border-white/10 rounded-[2rem] h-12 px-6 text-sm outline-none focus:border-indigo-500/50" />
             <Button onClick={() => sendMessage()} disabled={!newMessage.trim()} className="h-12 w-12 rounded-2xl bg-indigo-600 hover:bg-indigo-500 shadow-lg shadow-indigo-600/20 disabled:opacity-20"><Send className="w-5 h-5" /></Button>
             <AnimatePresence>{showOptions && (<motion.div initial={{ opacity: 0, y: 10, scale: 0.9 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 10, scale: 0.9 }} className="absolute bottom-20 left-0 w-64 bg-[#0a0a0a] border border-white/10 rounded-[2.5rem] p-4 shadow-2xl z-50 overflow-hidden"><div className="grid grid-cols-2 gap-2"><label className="flex flex-col items-center justify-center p-4 bg-white/[0.02] border border-white/5 rounded-2xl cursor-pointer"><ImageIcon className="w-6 h-6 text-indigo-400 mb-2" /><span className="text-[8px] font-black uppercase text-white/40">Photo</span><input type="file" className="hidden" accept="image/*" onChange={(e) => handleFileUpload(e, "image")} /></label><button onClick={() => startCamera()} className="flex flex-col items-center justify-center p-4 bg-purple-600/5 border border-purple-500/20 rounded-2xl"><Camera className="w-6 h-6 text-purple-400 mb-2" /><span className="text-[8px] font-black uppercase text-white/40">Snapshot</span></button></div></motion.div>)}</AnimatePresence>
           </div>
