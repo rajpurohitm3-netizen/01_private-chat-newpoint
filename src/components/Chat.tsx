@@ -61,70 +61,13 @@ export function Chat({ session, privateKey, initialContact, isPartnerOnline, onB
   const [contactProfile, setContactProfile] = useState<any>(initialContact);
   const [myPublicKey, setMyPublicKey] = useState<CryptoKey | null>(null);
   const [partnerPresence, setPartnerPresence] = useState<{isOnline: boolean; isInChat: boolean; isTyping: boolean;}>({ isOnline: false, isInChat: false, isTyping: false });
-  const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-
-  useEffect(() => {
-    const channelId = [session.user.id, initialContact.id].sort().join("-");
-    const channel = supabase.channel(`presence-${channelId}`);
-
-    channel
-      .on("presence", { event: "sync" }, () => {
-        const state = channel.presenceState();
-        const isInChat = Object.values(state).some((presences: any) => 
-          presences.some((p: any) => p.user_id === initialContact.id)
-        );
-        setPartnerPresence(prev => ({ ...prev, isInChat }));
-      })
-      .on("broadcast", { event: "typing" }, ({ payload }) => {
-        if (payload.user_id === initialContact.id) {
-          setPartnerPresence(prev => ({ ...prev, isTyping: payload.isTyping }));
-        }
-      })
-      .subscribe(async (status) => {
-        if (status === "SUBSCRIBED") {
-          await channel.track({
-            user_id: session.user.id,
-            online_at: new Date().toISOString(),
-          });
-        }
-      });
-
-    return () => {
-      channel.unsubscribe();
-    };
-  }, [initialContact.id, session.user.id]);
-
-  useEffect(() => {
-    setPartnerPresence(prev => ({ ...prev, isOnline: !!isPartnerOnline }));
-  }, [isPartnerOnline]);
-
-  const handleTyping = () => {
-    const channelId = [session.user.id, initialContact.id].sort().join("-");
-    const channel = supabase.channel(`presence-${channelId}`);
-    
-    channel.send({
-      type: "broadcast",
-      event: "typing",
-      payload: { user_id: session.user.id, isTyping: true },
-    });
-
-    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
-    
-    typingTimeoutRef.current = setTimeout(() => {
-      channel.send({
-        type: "broadcast",
-        event: "typing",
-        payload: { user_id: session.user.id, isTyping: false },
-      });
-    }, 3000);
-  };
   const [isFocused, setIsFocused] = useState(true);
   const [showSnapshotView, setShowSnapshotView] = useState<any>(null);
   const [showSaveToVault, setShowSaveToVault] = useState<any>(null);
   const [vaultPassword, setVaultPassword] = useState("");
   const [longPressedMessage, setLongPressedMessage] = useState<any>(null);
   const [showMenu, setShowMenu] = useState(false);
-  const [autoDeleteMode, setAutoDeleteMode] = useState<"none" | "view" | "3h">(() => {
+  const [autoDeleteMode, setAutoDeleteMode] = useState<"none" | "view" | "1m" | "3h">(() => {
     if (typeof window !== "undefined") {
       return (localStorage.getItem(`chatify_auto_delete_${session.user.id}`) as any) || "none";
     }
@@ -173,14 +116,30 @@ export function Chat({ session, privateKey, initialContact, isPartnerOnline, onB
 
   const decryptMessageContent = async (msg: any) => {
     try {
-      const packet = JSON.parse(msg.encrypted_content);
+      if (!msg.encrypted_content) return msg.content || "";
+      
+      let packet;
+      try {
+        packet = JSON.parse(msg.encrypted_content);
+      } catch (e) {
+        // Fallback for legacy messages that might be plain text or differently formatted
+        return msg.encrypted_content;
+      }
+
       if (!packet.iv || !packet.content || !packet.keys) return msg.encrypted_content;
+      
       const encryptedAESKey = packet.keys[session.user.id];
-      if (!encryptedAESKey) return "[Encryption Error: Key Missing]";
+      if (!encryptedAESKey) {
+        // Check if we are the sender and can decrypt with our own key
+        const myKey = packet.keys[session.user.id];
+        if (!myKey) return "[Encryption Error: Key Missing]";
+      }
+      
       const aesKey = await decryptAESKeyWithUserPrivateKey(encryptedAESKey, privateKey);
       return await decryptWithAES(packet.content, packet.iv, aesKey);
     } catch (e) {
-      return msg.encrypted_content;
+      console.error("Decryption failed:", e);
+      return "[Decryption Failed]";
     }
   };
 
@@ -199,44 +158,175 @@ export function Chat({ session, privateKey, initialContact, isPartnerOnline, onB
   }
 
   function subscribeToMessages() {
-    return supabase.channel(`chat-${initialContact.id}`).on("postgres_changes", { event: "INSERT", schema: "public", table: "messages", filter: `receiver_id=eq.${session.user.id}` }, async (payload) => {
-      if (payload.new.sender_id === initialContact.id) {
-        const decryptedContent = await decryptMessageContent(payload.new);
-        const msg = { ...payload.new, decrypted_content: decryptedContent };
-        setMessages(prev => [...prev, msg]);
-        await supabase.from("messages").update({ is_delivered: true, delivered_at: new Date().toISOString() }).eq("id", payload.new.id);
-        if (payload.new.media_type === 'snapshot') {
-          toast.info("Snapshot Received");
-          setShowSnapshotView(msg);
+    const channel = supabase.channel(`chat-${initialContact.id}`, {
+      config: {
+        presence: {
+          key: session.user.id,
+        },
+      },
+    });
+
+    channel
+      .on("postgres_changes", { 
+        event: "INSERT", 
+        schema: "public", 
+        table: "messages", 
+        filter: `receiver_id=eq.${session.user.id}` 
+      }, async (payload) => {
+        if (payload.new.sender_id === initialContact.id) {
+          const decryptedContent = await decryptMessageContent(payload.new);
+          const msg = { ...payload.new, decrypted_content: decryptedContent };
+          setMessages(prev => [...prev, msg]);
+          await supabase.from("messages").update({ is_delivered: true, delivered_at: new Date().toISOString() }).eq("id", payload.new.id);
+          if (payload.new.media_type === 'snapshot') {
+            toast.info("Snapshot Received");
+            setShowSnapshotView(msg);
+          }
         }
-      }
-    }).on("postgres_changes", { event: "UPDATE", schema: "public", table: "messages" }, async (payload) => {
-      const decryptedContent = await decryptMessageContent(payload.new);
-      setMessages(prev => prev.map(m => m.id === payload.new.id ? { ...payload.new, decrypted_content: decryptedContent } : m));
-    }).subscribe();
+      })
+      .on("postgres_changes", { 
+        event: "UPDATE", 
+        schema: "public", 
+        table: "messages" 
+      }, async (payload) => {
+        const decryptedContent = await decryptMessageContent(payload.new);
+        setMessages(prev => prev.map(m => m.id === payload.new.id ? { ...payload.new, decrypted_content: decryptedContent } : m));
+      })
+      .on("presence", { event: "sync" }, () => {
+        const state = channel.presenceState();
+        const isPartnerInChat = Object.values(state).some((presences: any) => 
+          presences.some((p: any) => p.user_id === initialContact.id)
+        );
+        setPartnerPresence(prev => ({ ...prev, isInChat: isPartnerInChat }));
+      })
+      .on("broadcast", { event: "typing" }, ({ payload }) => {
+        if (payload.userId === initialContact.id) {
+          setPartnerPresence(prev => ({ ...prev, isTyping: payload.isTyping }));
+        }
+      })
+      .subscribe(async (status) => {
+        if (status === "SUBSCRIBED") {
+          await channel.track({
+            user_id: session.user.id,
+            online_at: new Date().toISOString(),
+          });
+        }
+      });
+
+    return channel;
   }
 
   useEffect(() => {
     fetchMessages();
-    const subscription = subscribeToMessages();
-    return () => { supabase.removeChannel(subscription); };
+    const channel = subscribeToMessages();
+    return () => { 
+      supabase.removeChannel(channel); 
+    };
   }, [initialContact]);
 
-  useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
+  useEffect(() => {
+    if (!newMessage.trim()) {
+      if (isTyping) {
+        setIsTyping(false);
+        const channel = supabase.channel(`chat-${initialContact.id}`);
+        channel.subscribe(status => {
+          if (status === "SUBSCRIBED") {
+            channel.send({
+              type: "broadcast",
+              event: "typing",
+              payload: { userId: session.user.id, isTyping: false },
+            });
+          }
+        });
+      }
+      return;
+    }
+
+    if (!isTyping) {
+      setIsTyping(true);
+      const channel = supabase.channel(`chat-${initialContact.id}`);
+      channel.subscribe(status => {
+        if (status === "SUBSCRIBED") {
+          channel.send({
+            type: "broadcast",
+            event: "typing",
+            payload: { userId: session.user.id, isTyping: true },
+          });
+        }
+      });
+    }
+
+    const timeout = setTimeout(() => {
+      setIsTyping(false);
+      const channel = supabase.channel(`chat-${initialContact.id}`);
+      channel.subscribe(status => {
+        if (status === "SUBSCRIBED") {
+          channel.send({
+            type: "broadcast",
+            event: "typing",
+            payload: { userId: session.user.id, isTyping: false },
+          });
+        }
+      });
+    }, 3000);
+
+    return () => clearTimeout(timeout);
+  }, [newMessage]);
+
+  useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages, partnerPresence.isTyping]);
 
   async function sendMessage(mediaType: string = "text", mediaUrl: string | null = null) {
     if (!newMessage.trim() && !mediaUrl) return;
-    if (!myPublicKey || !initialContact.public_key) { toast.error("Encryption keys not synchronized."); return; }
+    
+    // Refresh partner's public key before sending to ensure we have the latest
+    const { data: latestProfile } = await supabase.from("profiles").select("public_key").eq("id", initialContact.id).single();
+    const partnerPublicKeyStr = latestProfile?.public_key || initialContact.public_key;
+
+    if (!myPublicKey || !partnerPublicKeyStr) { 
+      toast.error("Encryption keys not synchronized."); 
+      return; 
+    }
+
     try {
       const aesKey = await generateAESKey();
       const contentToEncrypt = newMessage.trim() || " ";
       const encrypted = await encryptWithAES(contentToEncrypt, aesKey);
-      const partnerKey = await importPublicKey(initialContact.public_key);
+      const partnerKey = await importPublicKey(partnerPublicKeyStr);
       const encryptedKeyForPartner = await encryptAESKeyForUser(aesKey, partnerKey);
       const encryptedKeyForMe = await encryptAESKeyForUser(aesKey, myPublicKey);
-      const packet = JSON.stringify({ iv: encrypted.iv, content: encrypted.content, keys: { [session.user.id]: encryptedKeyForMe, [initialContact.id]: encryptedKeyForPartner } });
-      const messageData: any = { sender_id: session.user.id, receiver_id: initialContact.id, encrypted_content: packet, media_type: mediaType, media_url: mediaUrl, is_viewed: false, is_delivered: partnerPresence.isOnline, expires_at: autoDeleteMode === "3h" ? new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString() : null, is_view_once: autoDeleteMode === "view" };
-      if (mediaType === 'snapshot') { messageData.view_count = 0; messageData.is_view_once = true; }
+      const packet = JSON.stringify({ 
+        iv: encrypted.iv, 
+        content: encrypted.content, 
+        keys: { 
+          [session.user.id]: encryptedKeyForMe, 
+          [initialContact.id]: encryptedKeyForPartner 
+        } 
+      });
+
+      let expiresAt = null;
+      if (autoDeleteMode === "1m") {
+        expiresAt = new Date(Date.now() + 60 * 1000).toISOString();
+      } else if (autoDeleteMode === "3h") {
+        expiresAt = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString();
+      }
+
+      const messageData: any = { 
+        sender_id: session.user.id, 
+        receiver_id: initialContact.id, 
+        encrypted_content: packet, 
+        media_type: mediaType, 
+        media_url: mediaUrl, 
+        is_viewed: false, 
+        is_delivered: partnerPresence.isOnline, 
+        expires_at: expiresAt,
+        is_view_once: autoDeleteMode === "view" 
+      };
+
+      if (mediaType === 'snapshot') { 
+        messageData.view_count = 0; 
+        messageData.is_view_once = true; 
+      }
+
       const { data, error } = await supabase.from("messages").insert(messageData).select();
       if (!error) {
         const sentMsg = data?.[0] || messageData;
@@ -244,6 +334,19 @@ export function Chat({ session, privateKey, initialContact, isPartnerOnline, onB
         setMessages(prev => [...prev, sentMsg]);
         setNewMessage("");
         setShowOptions(false);
+        
+        // Stop typing indicator immediately after sending
+        setIsTyping(false);
+        const channel = supabase.channel(`chat-${initialContact.id}`);
+        channel.subscribe(status => {
+          if (status === "SUBSCRIBED") {
+            channel.send({
+              type: "broadcast",
+              event: "typing",
+              payload: { userId: session.user.id, isTyping: false },
+            });
+          }
+        });
       }
     } catch (e) { toast.error("Encryption failed"); }
   }
@@ -320,7 +423,7 @@ export function Chat({ session, privateKey, initialContact, isPartnerOnline, onB
             <Button variant="ghost" size="icon" onClick={() => onInitiateCall(initialContact, "video")} className="text-white/20 hover:text-white hover:bg-white/5 rounded-xl"><Video className="w-4 h-4" /></Button>
             <div className="relative">
               <Button variant="ghost" size="icon" onClick={() => setShowMenu(!showMenu)} className="text-white/20 hover:text-white hover:bg-white/5 rounded-xl"><MoreVertical className="w-4 h-4" /></Button>
-              <AnimatePresence>{showMenu && (<motion.div initial={{ opacity: 0, y: 10, scale: 0.95 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 10, scale: 0.95 }} className="absolute right-0 top-12 w-48 bg-zinc-900 border border-white/10 rounded-2xl p-2 shadow-2xl z-50"><p className="text-[8px] font-black uppercase tracking-[0.2em] text-white/30 px-3 py-2">Auto-Delete Protocol</p>{[{ id: "none", label: "No Auto-Delete" }, { id: "view", label: "Delete After View" }, { id: "3h", label: "Delete After 3 Hours" }].map(opt => (<button key={opt.id} onClick={() => { setAutoDeleteMode(opt.id as any); setShowMenu(false); }} className={`w-full text-left px-3 py-2 rounded-xl text-[10px] font-bold uppercase tracking-widest transition-all ${autoDeleteMode === opt.id ? 'bg-indigo-600 text-white' : 'text-white/60 hover:bg-white/5'}`}>{opt.label}</button>))}</motion.div>)}</AnimatePresence>
+                <AnimatePresence>{showMenu && (<motion.div initial={{ opacity: 0, y: 10, scale: 0.95 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 10, scale: 0.95 }} className="absolute right-0 top-12 w-48 bg-zinc-900 border border-white/10 rounded-2xl p-2 shadow-2xl z-50"><p className="text-[8px] font-black uppercase tracking-[0.2em] text-white/30 px-3 py-2">Auto-Delete Protocol</p>{[{ id: "none", label: "No Auto-Delete" }, { id: "view", label: "Delete After View" }, { id: "1m", label: "Delete After 1 Minute" }, { id: "3h", label: "Delete After 3 Hours" }].map(opt => (<button key={opt.id} onClick={() => { setAutoDeleteMode(opt.id as any); setShowMenu(false); }} className={`w-full text-left px-3 py-2 rounded-xl text-[10px] font-bold uppercase tracking-widest transition-all ${autoDeleteMode === opt.id ? 'bg-indigo-600 text-white' : 'text-white/60 hover:bg-white/5'}`}>{opt.label}</button>))}</motion.div>)}</AnimatePresence>
             </div>
           </div>
       </header>
@@ -344,49 +447,50 @@ export function Chat({ session, privateKey, initialContact, isPartnerOnline, onB
               </motion.div>
             );
           })
-        )}
-          <div ref={messagesEndRef} />
-        </div>
-
-        <AnimatePresence>
-          {partnerPresence.isInChat && (
-            <motion.div 
-              initial={{ opacity: 0, x: -20 }}
-              animate={{ opacity: 1, x: 0 }}
-              exit={{ opacity: 0, x: -20 }}
-              className="absolute bottom-32 left-8 z-30 pointer-events-none"
-            >
-              <div className="flex items-center gap-3">
-                <motion.div
-                  animate={partnerPresence.isTyping ? {
-                    y: [0, -8, 0],
-                  } : {}}
-                  transition={{
-                    duration: 0.6,
-                    repeat: Infinity,
-                    ease: "easeInOut"
-                  }}
-                  className="w-3 h-3 bg-indigo-500 rounded-full shadow-[0_0_15px_rgba(99,102,241,0.6)]"
-                />
+          )}
+          
+          <AnimatePresence>
+            {partnerPresence.isInChat && (
+              <motion.div
+                initial={{ opacity: 0, scale: 0 }}
+                animate={{ opacity: 1, scale: 1 }}
+                exit={{ opacity: 0, scale: 0 }}
+                className="flex items-center gap-3 mt-4"
+              >
+                <div className="relative">
+                  <motion.div
+                    animate={partnerPresence.isTyping ? { 
+                      y: [0, -10, 0],
+                    } : {}}
+                    transition={{ 
+                      duration: 0.6, 
+                      repeat: Infinity, 
+                      ease: "easeInOut" 
+                    }}
+                    className="w-3 h-3 bg-indigo-500 rounded-full shadow-[0_0_10px_rgba(99,102,241,0.8)]"
+                  />
+                  <div className="absolute inset-0 bg-indigo-500 rounded-full blur-sm opacity-50 animate-pulse" />
+                </div>
                 {partnerPresence.isTyping && (
                   <motion.span 
                     initial={{ opacity: 0, x: -10 }}
                     animate={{ opacity: 1, x: 0 }}
-                    className="text-[8px] font-black uppercase tracking-[0.2em] text-indigo-400 bg-indigo-500/10 px-2 py-1 rounded-md border border-indigo-500/20"
+                    className="text-[10px] font-black uppercase tracking-[0.2em] text-indigo-400"
                   >
-                    Typing...
+                    Typing Signal...
                   </motion.span>
                 )}
-              </div>
-            </motion.div>
-          )}
-        </AnimatePresence>
+              </motion.div>
+            )}
+          </AnimatePresence>
 
-        <footer className="p-6 bg-black/40 backdrop-blur-3xl border-t border-white/5 shrink-0">
+          <div ref={messagesEndRef} />
+        </div>
 
+      <footer className="p-6 bg-black/40 backdrop-blur-3xl border-t border-white/5 shrink-0">
           <div className="flex items-center gap-3 relative">
             <Button variant="ghost" size="icon" onClick={() => setShowOptions(!showOptions)} className={`h-12 w-12 rounded-2xl transition-all ${showOptions ? 'bg-indigo-600 text-white rotate-45' : 'bg-white/5 text-white/20'}`}><Plus className="w-6 h-6" /></Button>
-            <input value={newMessage} onChange={(e) => { setNewMessage(e.target.value); handleTyping(); }} onKeyDown={(e) => e.key === "Enter" && sendMessage()} placeholder="Type signal packet..." className="flex-1 bg-white/[0.03] border border-white/10 rounded-[2rem] h-12 px-6 text-sm outline-none focus:border-indigo-500/50" />
+            <input value={newMessage} onChange={(e) => setNewMessage(e.target.value)} onKeyDown={(e) => e.key === "Enter" && sendMessage()} placeholder="Type signal packet..." className="flex-1 bg-white/[0.03] border border-white/10 rounded-[2rem] h-12 px-6 text-sm outline-none focus:border-indigo-500/50" />
             <Button onClick={() => sendMessage()} disabled={!newMessage.trim()} className="h-12 w-12 rounded-2xl bg-indigo-600 hover:bg-indigo-500 shadow-lg shadow-indigo-600/20 disabled:opacity-20"><Send className="w-5 h-5" /></Button>
             <AnimatePresence>{showOptions && (<motion.div initial={{ opacity: 0, y: 10, scale: 0.9 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 10, scale: 0.9 }} className="absolute bottom-20 left-0 w-64 bg-[#0a0a0a] border border-white/10 rounded-[2.5rem] p-4 shadow-2xl z-50 overflow-hidden"><div className="grid grid-cols-2 gap-2"><label className="flex flex-col items-center justify-center p-4 bg-white/[0.02] border border-white/5 rounded-2xl cursor-pointer"><ImageIcon className="w-6 h-6 text-indigo-400 mb-2" /><span className="text-[8px] font-black uppercase text-white/40">Photo</span><input type="file" className="hidden" accept="image/*" onChange={(e) => handleFileUpload(e, "image")} /></label><button onClick={() => startCamera()} className="flex flex-col items-center justify-center p-4 bg-purple-600/5 border border-purple-500/20 rounded-2xl"><Camera className="w-6 h-6 text-purple-400 mb-2" /><span className="text-[8px] font-black uppercase text-white/40">Snapshot</span></button></div></motion.div>)}</AnimatePresence>
           </div>
